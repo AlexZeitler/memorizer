@@ -29,10 +29,12 @@ public class WorkspaceTools
 
     // ===== Workspace Tools =====
 
-    [McpServerTool, Description("Get workspace information. Without an ID, lists root workspaces with hints about nested content. With an ID, shows detailed workspace info. With a query, searches all workspaces by name. Workspaces are organizational containers (e.g., 'Engineering', 'Sales') that persist indefinitely and can be nested.")]
+    [McpServerTool, Description("Get workspace information. Without an ID, lists root workspaces with hints about nested content. With an ID, shows detailed workspace info. With a slug, looks up a workspace by its URL-safe identifier (optionally scoped to a parent). With a query, searches all workspaces by name. Workspaces are organizational containers (e.g., 'Engineering', 'Sales') that persist indefinitely and can be nested.")]
     public async Task<string> GetWorkspace(
         [Description("Optional workspace ID. If omitted, lists root workspaces.")] string? workspaceId = null,
+        [Description("Optional workspace slug (URL-safe identifier). Unique within its parent scope; use parentWorkspaceId to disambiguate nested workspaces.")] string? slug = null,
         [Description("Optional search query to find workspaces by name (searches all levels). Case-insensitive partial match.")] string? query = null,
+        [Description("Optional parent workspace ID to scope a slug lookup. Omit to look up a slug among root workspaces.")] string? parentWorkspaceId = null,
         [Description("Include system workspaces (like 'Unfiled'). Only applies when listing workspaces.")] bool includeSystem = false,
         CancellationToken cancellationToken = default
     )
@@ -41,6 +43,22 @@ public class WorkspaceTools
         if (!string.IsNullOrWhiteSpace(query))
         {
             return await SearchWorkspacesAsync(query, includeSystem, cancellationToken);
+        }
+
+        // If slug is provided, look it up (optionally scoped to a parent workspace)
+        if (!string.IsNullOrWhiteSpace(slug))
+        {
+            // Slugs are stored lowercase (see GenerateSlug); normalize so lookups are case-insensitive.
+            var normalizedSlug = slug.Trim().ToLowerInvariant();
+            var parsedParentId = ParseOptionalGuid(parentWorkspaceId);
+            var parentId = parsedParentId.HasValue ? new WorkspaceId(parsedParentId.Value) : (WorkspaceId?)null;
+            var bySlug = await _storage.GetWorkspaceBySlugAsync(normalizedSlug, parentId, cancellationToken);
+            if (bySlug == null)
+            {
+                var scope = parentId.HasValue ? $" under parent {parentId.Value.Value}" : " among root workspaces";
+                return $"Workspace with slug '{normalizedSlug}' not found{scope}.";
+            }
+            return await GetWorkspaceDetailsAsync(bySlug, cancellationToken);
         }
 
         // Parse optional Guid defensively — MCP clients may send empty strings or "null"
@@ -53,7 +71,12 @@ public class WorkspaceTools
         }
 
         // Get specific workspace details
-        return await GetWorkspaceDetailsAsync(new WorkspaceId(parsedWorkspaceId.Value), cancellationToken);
+        var workspace = await _storage.GetWorkspaceAsync(new WorkspaceId(parsedWorkspaceId.Value), cancellationToken);
+        if (workspace == null)
+        {
+            return $"Workspace with ID {parsedWorkspaceId.Value} not found.";
+        }
+        return await GetWorkspaceDetailsAsync(workspace, cancellationToken);
     }
 
     private async Task<string> SearchWorkspacesAsync(string query, bool includeSystem, CancellationToken cancellationToken)
@@ -131,14 +154,9 @@ public class WorkspaceTools
         return result.ToString();
     }
 
-    private async Task<string> GetWorkspaceDetailsAsync(WorkspaceId workspaceId, CancellationToken cancellationToken)
+    private async Task<string> GetWorkspaceDetailsAsync(Workspace workspace, CancellationToken cancellationToken)
     {
-        var workspace = await _storage.GetWorkspaceAsync(workspaceId, cancellationToken);
-
-        if (workspace == null)
-        {
-            return $"Workspace with ID {workspaceId.Value} not found.";
-        }
+        var workspaceId = workspace.Id;
 
         // Get path for breadcrumb
         var path = await _storage.GetWorkspacePathAsync(workspaceId, cancellationToken);
@@ -803,19 +821,35 @@ public class WorkspaceTools
 
     // ===== Memory Organization Tools =====
 
-    [McpServerTool, Description("Move one or more memories to a project, workspace, or Unfiled. Consolidates all memory organization operations into a single tool.")]
+    [McpServerTool, Description("Move one or more memories to a project, workspace, or Unfiled. Consolidates all memory organization operations into a single tool. REQUIRED: memoryIds (array of GUID strings) and exactly one destination (projectId, workspaceId, or toUnfiled=true).")]
     public async Task<string> MoveMemory(
-        [Description("Memory ID(s) to move. Can be a single ID or array of IDs. Use Search or Get to find memory IDs.")] Guid[] memoryIds,
+        [Description("REQUIRED. Memory ID(s) to move as GUID strings. Can be a single ID or array of IDs. Use Search or Get to find memory IDs.")] string[]? memoryIds = null,
         [Description("Destination project ID. Use this to move memories into a project. Use ListProjects to find project IDs.")] string? projectId = null,
         [Description("Destination workspace ID. Use this to move memories directly to a workspace (not a project). Use ListWorkspaces to find workspace IDs.")] string? workspaceId = null,
         [Description("Set to true to move memories to the Unfiled workspace (unassign from current project/workspace).")] bool toUnfiled = false,
         CancellationToken cancellationToken = default
     )
     {
-        // Validate inputs
+        // Validate required parameter — MCP clients sometimes omit this entirely
         if (memoryIds == null || memoryIds.Length == 0)
         {
-            return "No memory IDs provided.";
+            return "Error: 'memoryIds' is required. Provide one or more memory GUIDs to move. Use Search or Get to find memory IDs.";
+        }
+
+        // Parse memory IDs defensively — MCP clients may send malformed values
+        var parsedIds = new List<Guid>();
+        var invalidIds = new List<string>();
+        foreach (var idStr in memoryIds)
+        {
+            if (Guid.TryParse(idStr, out var parsed))
+                parsedIds.Add(parsed);
+            else if (!string.IsNullOrWhiteSpace(idStr))
+                invalidIds.Add(idStr);
+        }
+
+        if (parsedIds.Count == 0)
+        {
+            return $"Error: No valid memory GUIDs found in memoryIds. Invalid values: [{string.Join(", ", invalidIds)}]. Provide valid GUID strings.";
         }
 
         // Parse optional Guid parameters defensively — MCP clients may send empty strings or "null"
@@ -867,7 +901,7 @@ public class WorkspaceTools
         var movedCount = 0;
         var notFoundIds = new List<Guid>();
 
-        foreach (var memoryId in memoryIds)
+        foreach (var memoryId in parsedIds)
         {
             var typedMemoryId = new MemoryId(memoryId);
 
@@ -899,17 +933,17 @@ public class WorkspaceTools
                 ? "\n\nHint: Memories directly in a workspace are general reference for that domain. Use projects for work-specific memories."
                 : "\n\nHint: Unfiled memories can be organized later into workspaces (persistent domains) or projects (completable work).";
 
-        if (memoryIds.Length == 1)
+        if (parsedIds.Count == 1)
         {
             if (notFoundIds.Count > 0)
             {
-                return $"Memory with ID {memoryIds[0]} not found.";
+                return $"Memory with ID {parsedIds[0]} not found.";
             }
             return $"Memory successfully moved to {destinationName}.{organizationHint}";
         }
 
         var result = new StringBuilder();
-        result.AppendLine($"Moved {movedCount} of {memoryIds.Length} memories to {destinationName}.");
+        result.AppendLine($"Moved {movedCount} of {parsedIds.Count} memories to {destinationName}.");
 
         if (notFoundIds.Count > 0)
         {

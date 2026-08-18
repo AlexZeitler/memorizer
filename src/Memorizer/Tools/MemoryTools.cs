@@ -30,32 +30,59 @@ public class MemoryTools
         _canonicalUrlService = canonicalUrlService;
     }
 
-    [McpServerTool, Description("Store a new memory in the database, optionally creating a relationship to another memory. Use this to save reference material, how-to guides, coding standards, or any information you (the LLM) may want to refer to when completing tasks. Include as much context as possible, such as markdown, code samples, and detailed explanations. Create relationships to link related reference materials or examples.")]
+    [McpServerTool, Description("Store a new memory in the database, optionally creating a relationship to another memory. Use this to save reference material, how-to guides, coding standards, or any information you (the LLM) may want to refer to when completing tasks. Include as much context as possible, such as markdown, code samples, and detailed explanations. Create relationships to link related reference materials or examples. REQUIRED parameters: type, text, source, title - all four MUST be provided.")]
     public async Task<string> Store(
-        [Description("The type of memory (e.g., 'conversation', 'document', 'reference', 'how-to', 'todo-list', etc.). Use 'reference' or 'how-to' for reusable knowledge.")] string type,
-        [Description("Plain text (markdown, code, prose, etc.) to store. Include as much context as possible.")] string text,
-        [Description("The source of the memory (e.g., 'user', 'system', 'LLM', etc.). Use 'LLM' if you are storing knowledge for your own future use.")] string source,
-        [Description("Title for the memory. Should be descriptive and searchable.")] string title,
+        [Description("REQUIRED. The type of memory (e.g., 'conversation', 'document', 'reference', 'how-to', 'todo-list', etc.). Use 'reference' or 'how-to' for reusable knowledge.")] string type,
+        [Description("REQUIRED. Plain text (markdown, code, prose, etc.) to store. Include as much context as possible.")] string text,
+        [Description("REQUIRED. The source of the memory (e.g., 'user', 'system', 'LLM', etc.). Use 'LLM' if you are storing knowledge for your own future use.")] string source,
+        [Description("REQUIRED. Title for the memory. Should be descriptive and searchable.")] string title,
         [Description("Optional tags to categorize the memory. Use tags like 'coding-standard', 'unit-test', 'reference', 'how-to', 'todo', etc. to make retrieval easier.")] string[]? tags = null,
         [Description("Confidence score for the memory (0.0 to 1.0)")] double confidence = 1.0,
         [Description("Optionally, the ID of a related memory. Use this to link related reference materials, how-tos, or examples.")] string? relatedTo = null,
         [Description("Optionally, the type of relationship to create (e.g., 'example-of', 'explains', 'related-to'). Use relationships to connect related knowledge.")] string? relationshipType = null,
-        [Description("Optional project ID to assign this memory to. If not provided, memory is stored in the Unfiled workspace. Use ListProjects to find available projects.")] string? projectId = null,
+        [Description("Optional project ID to assign this memory to. If not provided, memory is stored in the Unfiled workspace. Use ListProjects to find available projects. Mutually exclusive with workspaceId.")] string? projectId = null,
+        [Description("Optional workspace ID to assign this memory directly to a workspace. Mutually exclusive with projectId.")] string? workspaceId = null,
         [Description("Memory archetype: 'document' for living, editable content (default) or 'record' for historical, immutable records like work logs.")] string archetype = "document",
         CancellationToken cancellationToken = default
     )
     {
+        // Validate required parameters — MCP clients sometimes omit these entirely
+        if (string.IsNullOrWhiteSpace(type))
+            return "Error: 'type' is required. Provide a memory type such as 'document', 'reference', 'how-to', 'todo-list', or 'conversation'.";
+        if (string.IsNullOrWhiteSpace(text))
+            return "Error: 'text' is required. Provide the content to store as plain text (markdown, code, prose, etc.).";
+        if (string.IsNullOrWhiteSpace(source))
+            return "Error: 'source' is required. Provide the source of the memory (e.g., 'user', 'system', or 'LLM').";
+        if (string.IsNullOrWhiteSpace(title))
+            return "Error: 'title' is required. Provide a descriptive, searchable title for the memory.";
+
         // Parse archetype string to enum
         var archetypeEnum = ArchetypeEnumExtensions.ParseArchetype(archetype);
 
         // Parse optional Guid parameters defensively — MCP clients may send empty strings or "null"
-        var parsedProjectId = ParseOptionalGuid(projectId);
+        if (!TryParseOptionalGuid(projectId, out var parsedProjectId))
+        {
+            return "projectId must be a valid GUID, empty, or null.";
+        }
+
+        if (!TryParseOptionalGuid(workspaceId, out var parsedWorkspaceId))
+        {
+            return "workspaceId must be a valid GUID, empty, or null.";
+        }
+
+        if (parsedProjectId.HasValue && parsedWorkspaceId.HasValue)
+        {
+            return "projectId and workspaceId are mutually exclusive memory owners. Provide only one.";
+        }
+
         var parsedRelatedTo = ParseOptionalGuid(relatedTo);
 
-        // Determine owner based on projectId
+        // Determine owner based on projectId / workspaceId
         MemoryOwner? owner = parsedProjectId.HasValue
             ? MemoryOwner.ForProject(new ProjectId(parsedProjectId.Value))
-            : null; // null defaults to Unfiled in storage layer
+            : parsedWorkspaceId.HasValue
+                ? MemoryOwner.ForWorkspace(new WorkspaceId(parsedWorkspaceId.Value))
+                : null; // null defaults to Unfiled in storage layer
 
         // Create new memory
         var memory = await _storage.StoreMemory(
@@ -76,9 +103,12 @@ public class MemoryTools
             await _storage.CreateRelationship(memory.Id, (MemoryId)parsedRelatedTo.Value, relationshipType, cancellationToken);
         }
 
-        var locationInfo = owner != null
-            ? $"Assigned to project {parsedProjectId}."
-            : "Stored in Unfiled workspace.";
+        var locationInfo = owner?.Type switch
+        {
+            OwnerTypeEnum.Project => $"Assigned to project {parsedProjectId}.",
+            OwnerTypeEnum.Workspace => $"Assigned to workspace {parsedWorkspaceId}.",
+            _ => "Stored in Unfiled workspace."
+        };
 
         var urlInfo = _canonicalUrlService.IsConfigured
             ? $"\n\nView in web UI: {_canonicalUrlService.GetMemoryUrl(memory.Id)}"
@@ -87,15 +117,21 @@ public class MemoryTools
         return $"Memory stored successfully with ID: {memory.Id}. {locationInfo} Archetype: {archetypeEnum.ToStringValue()}. Use Edit tool to make targeted updates, or CreateReference to link to other memories.{urlInfo}";
     }
 
-    [McpServerTool, Description("Edit an existing memory using find-and-replace. Ideal for checking off to-do items, updating sections, or fixing typos. IMPORTANT: The edit will FAIL if old_text is not found exactly - always use Get first to see current content and copy the exact text to replace. All changes are versioned and can be reverted.")]
+    [McpServerTool, Description("Edit an existing memory using find-and-replace. Ideal for checking off to-do items, updating sections, or fixing typos. IMPORTANT: The edit will FAIL if old_text is not found exactly - always use Get first to see current content and copy the exact text to replace. All changes are versioned and can be reverted. REQUIRED parameters: id, old_text, new_text - all three MUST be provided.")]
     public async Task<string> Edit(
-        [Description("The ID of the memory to edit.")] Guid id,
-        [Description("The exact text to find and replace. Must match exactly (case-sensitive). For multi-line replacements, include the full text including newlines.")] string old_text,
-        [Description("The text to replace it with. Can be different length than old_text.")] string new_text,
+        [Description("REQUIRED. The ID of the memory to edit.")] Guid id,
+        [Description("REQUIRED. The exact text to find and replace. Must match exactly (case-sensitive). For multi-line replacements, include the full text including newlines.")] string old_text,
+        [Description("REQUIRED. The text to replace it with. Can be different length than old_text.")] string new_text,
         [Description("If true, replaces ALL occurrences of old_text. If false (default), only replaces the first occurrence. Use false for safety when editing unique content.")] bool replace_all = false,
         CancellationToken cancellationToken = default
     )
     {
+        // Validate required parameters — MCP clients sometimes omit these entirely
+        if (string.IsNullOrWhiteSpace(old_text))
+            return "Error: 'old_text' is required. Provide the exact text to find and replace. Use the Get tool first to see current content and copy the exact text.";
+        if (new_text == null)
+            return "Error: 'new_text' is required. Provide the replacement text (can be empty string to delete text).";
+
         using var activity = TelemetryConfig.ActivitySource.StartActivity("MemoryTools.Edit");
 
         activity?.AddEvent(new ActivityEvent("edit.details", DateTimeOffset.UtcNow, new ActivityTagsCollection
@@ -277,9 +313,10 @@ public class MemoryTools
         [Description("Maximum number of results to return")] int limit = 10,
         [Description("Minimum similarity threshold (0.0 to 1.0)")] double minSimilarity = 0.7,
         [Description("Optional tags to filter memories (e.g., 'reference', 'how-to', 'coding-standard')")] string[]? filterTags = null,
-        [Description("Optional project ID to scope search to. If provided, only searches memories assigned to this project. Use ListProjects to find available projects.")] string? projectId = null,
+        [Description("Optional project ID to scope search to. If provided, only searches memories assigned to this project. Use ListProjects to find available projects. Mutually exclusive with workspaceId.")] string? projectId = null,
         [Description("When projectId is specified, also include memories in the Unfiled workspace. Useful for finding unorganized content that might be relevant.")] bool includeUnassigned = false,
         [Description("Include archived memories in search results. Default is false (archived memories are hidden).")] bool includeArchived = false,
+        [Description("Optional workspace ID to scope search to. If provided, searches memories owned directly by the workspace plus all memories owned by projects within it (direct children only, not sub-workspaces). Mutually exclusive with projectId.")] string? workspaceId = null,
         CancellationToken cancellationToken = default
     )
     {
@@ -293,13 +330,28 @@ public class MemoryTools
             {"query.minSimilarity", minSimilarity.ToString()},
             {"query.filterTags", filterTags != null ? string.Join(", ", filterTags) : "none"},
             {"query.projectId", projectId ?? "none"},
+            {"query.workspaceId", workspaceId ?? "none"},
             {"query.includeUnassigned", includeUnassigned.ToString()},
             {"query.includeArchived", includeArchived.ToString()}
         }));
 
-        // Convert projectId to typed ProjectId — parse defensively since MCP clients may send empty strings
-        var parsedProjectId = ParseOptionalGuid(projectId);
+        // Convert projectId / workspaceId to typed IDs — parse defensively since MCP clients may send empty strings
+        if (!TryParseOptionalGuid(projectId, out var parsedProjectId))
+        {
+            return "projectId must be a valid GUID, empty, or null.";
+        }
+
+        if (!TryParseOptionalGuid(workspaceId, out var parsedWorkspaceId))
+        {
+            return "workspaceId must be a valid GUID, empty, or null.";
+        }
+
+        if (parsedProjectId.HasValue && parsedWorkspaceId.HasValue)
+        {
+            return "projectId and workspaceId are mutually exclusive search scopes. Provide only one.";
+        }
         ProjectId? typedProjectId = parsedProjectId.HasValue ? new ProjectId(parsedProjectId.Value) : null;
+        WorkspaceId? typedWorkspaceId = parsedWorkspaceId.HasValue ? new WorkspaceId(parsedWorkspaceId.Value) : null;
 
         // Use hybrid search combining vector similarity + PostgreSQL full-text search via RRF
         List<Memory> memories = await _storage.HybridSearch(
@@ -311,6 +363,7 @@ public class MemoryTools
             includeUnassigned,
             includeArchived,
             includeSystem: false,
+            typedWorkspaceId,
             cancellationToken
         );
 
@@ -342,6 +395,7 @@ public class MemoryTools
                 includeUnassigned,
                 includeArchived,
                 includeSystem: false,
+                typedWorkspaceId,
                 cancellationToken
             );
 
@@ -791,15 +845,28 @@ public class MemoryTools
         return result.ToString();
     }
 
-    [McpServerTool, Description("Create a reference (relationship) between two memories. Use this to link related reference materials, how-tos, or examples (e.g., 'example-of', 'explains', 'related-to'). References help organize knowledge for easier retrieval and understanding.")]
+    [McpServerTool, Description("Create a reference (relationship) between two memories. Use this to link related reference materials, how-tos, or examples (e.g., 'example-of', 'explains', 'related-to'). References help organize knowledge for easier retrieval and understanding. REQUIRED parameters: fromId, toId, type - all three MUST be provided as valid memory GUIDs and a relationship type string.")]
     public async Task<string> CreateReference(
-        [Description("The ID of the source memory (e.g., the reference or how-to that is providing context)")] Guid fromId,
-        [Description("The ID of the target memory (e.g., the example or related reference)")] Guid toId,
-        [Description("The type of reference (e.g., 'example-of', 'explains', 'related-to'). Use references to connect and organize knowledge.")] string type,
+        [Description("REQUIRED. The ID (GUID) of the source memory (e.g., the reference or how-to that is providing context). Must be a valid GUID.")] string? fromId = null,
+        [Description("REQUIRED. The ID (GUID) of the target memory (e.g., the example or related reference). Must be a valid GUID.")] string? toId = null,
+        [Description("REQUIRED. The type of reference (e.g., 'example-of', 'explains', 'related-to'). Use references to connect and organize knowledge.")] string? type = null,
         CancellationToken cancellationToken = default
     )
     {
-        var rel = await _storage.CreateRelationship((MemoryId)fromId, (MemoryId)toId, type, cancellationToken);
+        // Validate required parameters — MCP clients sometimes omit these or send malformed values
+        if (string.IsNullOrWhiteSpace(fromId))
+            return "Error: 'fromId' is required. Provide the GUID of the source memory. Use Search or Get to find memory IDs.";
+        if (string.IsNullOrWhiteSpace(toId))
+            return "Error: 'toId' is required. Provide the GUID of the target memory. Use Search or Get to find memory IDs.";
+        if (string.IsNullOrWhiteSpace(type))
+            return "Error: 'type' is required. Provide the relationship type (e.g., 'example-of', 'explains', 'related-to').";
+
+        if (!Guid.TryParse(fromId, out var parsedFromId))
+            return $"Error: 'fromId' must be a valid GUID. Received: '{fromId}'.";
+        if (!Guid.TryParse(toId, out var parsedToId))
+            return $"Error: 'toId' must be a valid GUID. Received: '{toId}'.";
+
+        var rel = await _storage.CreateRelationship((MemoryId)parsedFromId, (MemoryId)parsedToId, type, cancellationToken);
         return $"Reference created: {rel.Id} from {rel.FromMemoryId} to {rel.ToMemoryId} (type: {rel.Type})";
     }
 
@@ -1204,5 +1271,16 @@ public class MemoryTools
         if (string.IsNullOrWhiteSpace(value)) return null;
         if (value.Equals("null", StringComparison.OrdinalIgnoreCase)) return null;
         return Guid.TryParse(value, out var guid) ? guid : null;
+    }
+
+    private static bool TryParseOptionalGuid(string? value, out Guid? guid)
+    {
+        guid = null;
+        if (string.IsNullOrWhiteSpace(value)) return true;
+        if (value.Equals("null", StringComparison.OrdinalIgnoreCase)) return true;
+        if (!Guid.TryParse(value, out var parsed)) return false;
+
+        guid = parsed;
+        return true;
     }
 }

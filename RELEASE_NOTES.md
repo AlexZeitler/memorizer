@@ -1,3 +1,68 @@
+#### 2.3.0 August 17th 2026 ####
+
+**Features**
+- [Upgrade Model Context Protocol SDK to 2.2.0](https://github.com/petabridge/memorizer/pull/211) - Moves Memorizer onto the stable MCP SDK
+  - The MCP server now runs in stateless Streamable HTTP mode
+  - Adds MCP endpoint integration tests driven by a lightweight SDK client
+- [Expose MCP prompts that teach correct Memorizer usage](https://github.com/petabridge/memorizer/pull/212) - Adds seven guided prompts written in Simplified Technical English
+  - `memorizer_overview`, `store_memory`, `find_context`, `review_project`, `organize_memory`, `maintain_memory`, and `start_project`
+- [Add start_project prompt and a workspace-tree MCP resource](https://github.com/petabridge/memorizer/pull/213) - Exposes the live workspace and project hierarchy as readable MCP context
+  - The `memorizer://workspaces` resource surfaces the current workspace/project tree so agents can orient before acting
+
+**Security**
+- [Pin SSH.NET to 2026.0.0 to fix high-severity advisory (GHSA-q939-rpr3-3284)](https://github.com/petabridge/memorizer/pull/207) - Addresses a high-severity advisory pulled in transitively via Testcontainers
+- [Bump OpenTelemetry packages to 1.17.0 to fix moderate advisories](https://github.com/petabridge/memorizer/pull/208) - Resolves four moderate denial-of-service advisories in `OpenTelemetry.Api` and the OTLP exporter
+
+**Bug Fixes**
+- [Fix canonical URLs for projects and workspaces](https://github.com/petabridge/memorizer/pull/205) - MCP tool responses now link to the correct web UI routes ([#204](https://github.com/petabridge/memorizer/issues/204))
+  - Project and workspace links now use the plural `/projects/{id}` and `/workspaces/{id}` routes
+- [Fix connection-pool self-deadlock in Get/GetMany relationship loading](https://github.com/petabridge/memorizer/pull/209) - Prevents pool exhaustion under concurrency during relationship loading
+  - `Get`, `GetMany`, and the remaining query paths now reuse a single pooled connection instead of holding two ([#210](https://github.com/petabridge/memorizer/pull/210))
+- [Fix embedding search threshold trap and remove random-embedding fallback](https://github.com/petabridge/memorizer/pull/215) - Corrects similarity-threshold behavior and surfaces embedding failures
+  - `minSimilarity: 0.0` now means "no threshold" instead of filtering out all results
+  - Embedding failures now surface loudly instead of silently persisting a random vector
+
+#### 2.2.0 July 3rd 2026 ####
+
+**Features**
+- [Support get_workspace by slug](https://github.com/petabridge/memorizer/pull/199) - The `GetWorkspace` MCP tool now accepts workspace slugs in addition to IDs
+  - Enables workspace lookup without needing to know the workspace ID in advance
+  - Slug matching is case-insensitive
+
+**Bug Fixes**
+- [Make MCP tools resilient to missing required parameters](https://github.com/petabridge/memorizer/pull/184) - MCP tools now return descriptive error messages when required parameters are missing or malformed, instead of throwing unhandled exceptions
+  - Fixes compatibility with MCP clients (Claude Code, opencode) that may omit required parameters
+  - Affected tools: `Store`, `Edit`, `CreateReference`, `MoveMemory`
+
+#### 2.2.0-beta2 July 1st 2026 ####
+
+**Features**
+- [Add workspace scope to memory tools](https://github.com/petabridge/memorizer/pull/197) - Memory search and storage now support workspace-level scoping
+  - `SearchMemories` can filter by workspace ID to query all memories in a workspace in a single call
+  - `Store` supports assigning memories directly to workspaces (not just projects)
+  - Closes scoping gaps for agents operating at the workspace level
+
+#### 2.2.0-beta1 June 26th 2026 ####
+
+**Features**
+- [Add cross-project tag filtering with multi-tag selection and dynamic filter panel](https://github.com/petabridge/memorizer/pull/168) - Filter memories across projects and workspaces by tags, type, and location from a persistent filter panel
+  - Multi-tag selection with searchable suggestions and removable filter badges
+  - Tag suggestions and location filters update dynamically based on the current filter context
+  - Memory cards show owner badges when filtering across locations, and tag badges link directly to filtered results
+  - MCP `GetByFilter` supports filtering by type, location, and tags
+- [Harden OpenAI-compatible embedding provider support](https://github.com/petabridge/memorizer/pull/194) - Improves OpenAI-compatible embedding provider configuration, migration behavior, and credential safety
+  - Embedding API keys are read from runtime configuration instead of persisted provider settings
+  - Sensitive provider configuration values are stripped before API display or database storage
+  - Adds a database migration to remove previously persisted provider API keys from `provider_settings.config`
+  - Makes fallback embedding dimensions safer during dimension migrations
+
+**Bug Fixes**
+- [Self-heal stale dimension configuration after migration](https://github.com/petabridge/memorizer/pull/177) - Automatically reconciles `embedding_config` when the live provider probe and database schema already match, avoiding unnecessary reruns of embedding dimension migration
+
+**Updates**
+- [Bump Akka.Streams from 1.5.60 to 1.5.62](https://github.com/petabridge/memorizer/pull/172)
+- [Bump Dapper from 2.1.66 to 2.1.72](https://github.com/petabridge/memorizer/pull/180)
+
 #### 2.1.0 March 4th 2026 ####
 
 **Features**

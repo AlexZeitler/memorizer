@@ -3,21 +3,31 @@
     <Copyright>© $([System.DateTime]::Now.Year)</Copyright>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/petabridge/memorizer-v1</PackageProjectUrl>
-    <VersionPrefix>2.1.0</VersionPrefix>
+    <VersionPrefix>2.3.0</VersionPrefix>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <WarningsNotAsErrors>CS1591</WarningsNotAsErrors>
     <Deterministic>true</Deterministic>
     <PackageReleaseNotes>**Features**
-- [Add move-project-to-workspace and workspace reparenting](https://github.com/petabridge/memorizer/pull/167) - Move projects between workspaces and reparent workspaces in the hierarchy
-  - `MoveProjectToWorkspaceAsync` atomically moves a project and all its descendants to a target workspace
-  - Workspace reparenting with circular-reference guard to prevent invalid hierarchies
-  - Full support across REST API, MCP tools, and Web UI with modal dialogs
-- [Add canonical URL support to MCP tool responses](https://github.com/petabridge/memorizer/pull/162) - MCP tool responses now include clickable URLs to the web UI for memories, workspaces, and projects
-  - Configure via `Server:CanonicalUrl` setting to enable links in MCP responses
-  - URLs included in `Store`, `Get`, `SearchMemories`, `GetMany`, `CreateWorkspace`, `CreateProject`, `GetWorkspace`, and `GetProjectContext` responses
+- [Upgrade Model Context Protocol SDK to 2.2.0](https://github.com/petabridge/memorizer/pull/211) - Moves Memorizer onto the stable MCP SDK
+  - The MCP server now runs in stateless Streamable HTTP mode
+  - Adds MCP endpoint integration tests driven by a lightweight SDK client
+- [Expose MCP prompts that teach correct Memorizer usage](https://github.com/petabridge/memorizer/pull/212) - Adds seven guided prompts written in Simplified Technical English
+  - `memorizer_overview`, `store_memory`, `find_context`, `review_project`, `organize_memory`, `maintain_memory`, and `start_project`
+- [Add start_project prompt and a workspace-tree MCP resource](https://github.com/petabridge/memorizer/pull/213) - Exposes the live workspace and project hierarchy as readable MCP context
+  - The `memorizer://workspaces` resource surfaces the current workspace/project tree so agents can orient before acting
+
+**Security**
+- [Pin SSH.NET to 2026.0.0 to fix high-severity advisory (GHSA-q939-rpr3-3284)](https://github.com/petabridge/memorizer/pull/207) - Addresses a high-severity advisory pulled in transitively via Testcontainers
+- [Bump OpenTelemetry packages to 1.17.0 to fix moderate advisories](https://github.com/petabridge/memorizer/pull/208) - Resolves four moderate denial-of-service advisories in `OpenTelemetry.Api` and the OTLP exporter
 
 **Bug Fixes**
-- [Make optional Guid MCP parameters resilient to client schema variations](https://github.com/petabridge/memorizer/pull/166) - Fixes compatibility with MCP clients (notably Cursor) that send empty strings or `"null"` for optional Guid parameters instead of proper JSON null</PackageReleaseNotes>
+- [Fix canonical URLs for projects and workspaces](https://github.com/petabridge/memorizer/pull/205) - MCP tool responses now link to the correct web UI routes ([#204](https://github.com/petabridge/memorizer/issues/204))
+  - Project and workspace links now use the plural `/projects/{id}` and `/workspaces/{id}` routes
+- [Fix connection-pool self-deadlock in Get/GetMany relationship loading](https://github.com/petabridge/memorizer/pull/209) - Prevents pool exhaustion under concurrency during relationship loading
+  - `Get`, `GetMany`, and the remaining query paths now reuse a single pooled connection instead of holding two ([#210](https://github.com/petabridge/memorizer/pull/210))
+- [Fix embedding search threshold trap and remove random-embedding fallback](https://github.com/petabridge/memorizer/pull/215) - Corrects similarity-threshold behavior and surfaces embedding failures
+  - `minSimilarity: 0.0` now means "no threshold" instead of filtering out all results
+  - Embedding failures now surface loudly instead of silently persisting a random vector</PackageReleaseNotes>
     <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
   </PropertyGroup>
 </Project>

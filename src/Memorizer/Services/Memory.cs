@@ -140,6 +140,7 @@ public interface IStorage
         bool includeUnassigned = false,
         bool includeArchived = false,
         bool includeSystem = false,
+        WorkspaceId? workspaceId = null,
         CancellationToken cancellationToken = default
     );
 
@@ -160,6 +161,7 @@ public interface IStorage
         bool includeUnassigned = false,
         bool includeArchived = false,
         bool includeSystem = false,
+        WorkspaceId? workspaceId = null,
         CancellationToken cancellationToken = default
     );
 
@@ -647,11 +649,15 @@ public class Storage : IStorage
             ? "AND archetype != 3"  // Exclude only System
             : "AND archetype IN (0, 1)";  // Only Document and Record
 
+        // minSimilarity 0.0 == no threshold: omit the distance predicate (see BuildDistanceFilter).
+        string distanceFilter = BuildDistanceFilter(effectiveMinSimilarity, "embedding <=> @embedding");
+
         string sql =
             $@"
             SELECT id, type_legacy, content, text, source, embedding, embedding_metadata, tags, confidence, created_at, updated_at, title, current_version, owner_type, owner_id, archetype, embedding <=> @embedding AS similarity
             FROM memories
-            WHERE embedding <=> @embedding < @maxDistance
+            WHERE embedding IS NOT NULL
+            {distanceFilter}
             {archetypeFilter}
             ORDER BY embedding <=> @embedding LIMIT @limit";
 
@@ -662,19 +668,23 @@ public class Storage : IStorage
 
         List<Memorizer.Models.Memory> memories = [];
         List<MemoryId> memoryIds = new();
-        await using NpgsqlDataReader reader = await cmd.ExecuteReaderAsync(cancellationToken);
-
-        while (await reader.ReadAsync(cancellationToken))
+        // Read the matched memories first, then dispose the reader before the relationship query
+        // runs on the SAME connection (Npgsql has no MARS), keeping this call to a single pooled
+        // connection and preventing hold-and-wait pool deadlock under concurrency.
+        await using (NpgsqlDataReader reader = await cmd.ExecuteReaderAsync(cancellationToken))
         {
-            var memory = ReadMemoryFromReader(reader, withSimilarity: true);
-            memories.Add(memory);
-            memoryIds.Add(memory.Id);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                var memory = ReadMemoryFromReader(reader, withSimilarity: true);
+                memories.Add(memory);
+                memoryIds.Add(memory.Id);
+            }
         }
 
-        // Batch fetch relationships for all found memories
+        // Batch fetch relationships for all found memories on the same connection
         if (memoryIds.Count > 0)
         {
-            var relationships = await GetRelationshipsForMany(memoryIds, cancellationToken);
+            var relationships = await GetRelationshipsForMany(connection, memoryIds, cancellationToken);
             var relLookup = relationships.GroupBy(r => r.FromMemoryId).ToDictionary(g => g.Key, g => g.ToList());
             foreach (var memory in memories)
             {
@@ -720,20 +730,25 @@ public class Storage : IStorage
             FROM memories
             WHERE id = @id";
 
-        await using NpgsqlCommand cmd = new(sql, connection);
-        cmd.Parameters.AddWithValue("id", id.Value);
-
-        await using NpgsqlDataReader reader = await cmd.ExecuteReaderAsync(cancellationToken);
-
-        if (await reader.ReadAsync(cancellationToken))
+        Memorizer.Models.Memory? memory = null;
+        // Read the memory, then dispose the reader before loading relationships on the SAME
+        // connection. Npgsql has no MARS, so the reader must be closed first; reusing this
+        // connection (instead of opening a second one) keeps the call to a single pooled
+        // connection and prevents hold-and-wait pool deadlock under concurrency.
+        await using (NpgsqlCommand cmd = new(sql, connection))
         {
-            var memory = ReadMemoryFromReader(reader, withSimilarity: false);
-            // Fetch relationships for this memory
-            memory.Relationships = await GetRelationships(memory.Id, type: null, includeArchivedTargets: false, cancellationToken);
-            return memory;
+            cmd.Parameters.AddWithValue("id", id.Value);
+            await using NpgsqlDataReader reader = await cmd.ExecuteReaderAsync(cancellationToken);
+            if (await reader.ReadAsync(cancellationToken))
+                memory = ReadMemoryFromReader(reader, withSimilarity: false);
         }
 
-        return null;
+        if (memory is null)
+            return null;
+
+        // Fetch relationships for this memory on the same connection.
+        memory.Relationships = await GetRelationships(connection, memory.Id, type: null, includeArchivedTargets: false, cancellationToken);
+        return memory;
     }
 
     public async Task<bool> Delete(
@@ -766,21 +781,27 @@ public class Storage : IStorage
             SELECT id, type_legacy, content, text, source, embedding, embedding_metadata, tags, confidence, created_at, updated_at, title, current_version, owner_type, owner_id, archetype
             FROM memories
             WHERE id = ANY(@ids)";
-        await using NpgsqlCommand cmd = new(sql, connection);
-        cmd.Parameters.AddWithValue("ids", ids.Select(id => id.Value).ToArray());
         List<Memorizer.Models.Memory> memories = [];
         List<MemoryId> memoryIds = new();
-        await using NpgsqlDataReader reader = await cmd.ExecuteReaderAsync(cancellationToken);
-        while (await reader.ReadAsync(cancellationToken))
+        // Read the memories first, then fully dispose the reader/command before issuing the
+        // relationship query on the SAME connection. Npgsql has no MARS, so the reader must be
+        // closed first; reusing this connection (instead of opening a second one) keeps the call
+        // to a single pooled connection and prevents hold-and-wait pool deadlock under concurrency.
+        await using (NpgsqlCommand cmd = new(sql, connection))
         {
-            var memory = ReadMemoryFromReader(reader, withSimilarity: false);
-            memories.Add(memory);
-            memoryIds.Add(memory.Id);
+            cmd.Parameters.AddWithValue("ids", ids.Select(id => id.Value).ToArray());
+            await using NpgsqlDataReader reader = await cmd.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                var memory = ReadMemoryFromReader(reader, withSimilarity: false);
+                memories.Add(memory);
+                memoryIds.Add(memory.Id);
+            }
         }
-        // Batch fetch relationships for all found memories - now safe from infinite recursion!
+        // Batch fetch relationships for all found memories on the same connection - safe from recursion.
         if (memoryIds.Count > 0)
         {
-            var relationships = await GetRelationshipsForMany(memoryIds, cancellationToken);
+            var relationships = await GetRelationshipsForMany(connection, memoryIds, cancellationToken);
             var relLookup = relationships.GroupBy(r => r.FromMemoryId).ToDictionary(g => g.Key, g => g.ToList());
             foreach (var memory in memories)
             {
@@ -827,7 +848,14 @@ public class Storage : IStorage
     public async Task<List<MemoryRelationship>> GetRelationships(MemoryId memoryId, string? type = null, bool includeArchivedTargets = false, CancellationToken cancellationToken = default)
     {
         await using NpgsqlConnection connection = await _dataSource.OpenConnectionAsync(cancellationToken);
+        return await GetRelationships(connection, memoryId, type, includeArchivedTargets, cancellationToken);
+    }
 
+    // Overload that reuses an already-open connection instead of checking out a second one from the
+    // pool. Callers that already hold a connection (e.g. Get) must dispose any open reader before
+    // calling this, since Npgsql has no MARS.
+    private async Task<List<MemoryRelationship>> GetRelationships(NpgsqlConnection connection, MemoryId memoryId, string? type, bool includeArchivedTargets, CancellationToken cancellationToken)
+    {
         // Single query with JOIN to get relationships and related memory titles/types - NO RECURSION!
         // Optionally filter out relationships pointing to archived memories
         string sql = $@"
@@ -896,8 +924,11 @@ public class Storage : IStorage
         // similarity = 1 - distance, so distance = 1 - similarity
         double maxDistance = effectiveMinSimilarity.ToDistance();
 
+        // minSimilarity 0.0 == no threshold: omit the distance predicate (see BuildDistanceFilter).
+        string distanceFilter = BuildDistanceFilter(effectiveMinSimilarity, "m.embedding_metadata <=> @embedding");
+
         // Query for similar memories using metadata embeddings, excluding self, archived, and checking for existing relationships
-        const string sql = @"
+        string sql = $@"
             SELECT m.id, m.title, m.type_legacy,
                    1 - (m.embedding_metadata <=> @embedding) AS similarity,
                    CASE WHEN EXISTS (
@@ -908,7 +939,7 @@ public class Storage : IStorage
             FROM memories m
             WHERE m.id != @sourceId
               AND m.embedding_metadata IS NOT NULL
-              AND m.embedding_metadata <=> @embedding < @maxDistance
+              {distanceFilter}
               AND m.archetype IN (0, 1)  -- Only Document and Record, exclude Archived and System
             ORDER BY m.embedding_metadata <=> @embedding
             LIMIT @limit";
@@ -971,15 +1002,18 @@ public class Storage : IStorage
         cmd.Parameters.AddWithValue("offset", (page - 1) * pageSize);
 
         List<Memorizer.Models.Memory> memories = [];
-        await using NpgsqlDataReader reader = await cmd.ExecuteReaderAsync(cancellationToken);
-
-        while (await reader.ReadAsync(cancellationToken))
+        // Read all rows and dispose the reader before loading relationships, so the relationship
+        // queries reuse THIS connection instead of each opening a second pooled connection while
+        // the reader is held open (which risks pool exhaustion/deadlock under concurrency).
+        await using (NpgsqlDataReader reader = await cmd.ExecuteReaderAsync(cancellationToken))
         {
-            var memory = ReadMemoryFromReader(reader, withSimilarity: false);
-            // Fetch relationships for this memory
-            memory.Relationships = await GetRelationships(memory.Id, type: null, includeArchivedTargets: false, cancellationToken);
-            memories.Add(memory);
+            while (await reader.ReadAsync(cancellationToken))
+                memories.Add(ReadMemoryFromReader(reader, withSimilarity: false));
         }
+
+        // Fetch relationships for each memory on the same connection.
+        foreach (var memory in memories)
+            memory.Relationships = await GetRelationships(connection, memory.Id, type: null, includeArchivedTargets: false, cancellationToken);
 
         return (memories, (int)totalCount);
     }
@@ -1138,7 +1172,14 @@ public class Storage : IStorage
     private async Task<List<MemoryRelationship>> GetRelationshipsForMany(IEnumerable<MemoryId> memoryIds, CancellationToken cancellationToken, bool includeArchivedTargets = false)
     {
         await using NpgsqlConnection connection = await _dataSource.OpenConnectionAsync(cancellationToken);
+        return await GetRelationshipsForMany(connection, memoryIds, cancellationToken, includeArchivedTargets);
+    }
 
+    // Overload that reuses an already-open connection instead of checking out a second one from the
+    // pool. Callers that already hold a connection (e.g. GetMany) must dispose any open reader before
+    // calling this, since Npgsql has no MARS.
+    private async Task<List<MemoryRelationship>> GetRelationshipsForMany(NpgsqlConnection connection, IEnumerable<MemoryId> memoryIds, CancellationToken cancellationToken, bool includeArchivedTargets = false)
+    {
         // Single query to get relationships with related memory titles/types - NO RECURSION!
         // Optionally filter out relationships pointing to archived memories
         string sql = $@"
@@ -1277,11 +1318,15 @@ public class Storage : IStorage
             ? "AND archetype != 3"  // Exclude only System
             : "AND archetype IN (0, 1)";  // Only Document and Record
 
+        // minSimilarity 0.0 == no threshold: omit the distance predicate (see BuildDistanceFilter).
+        string distanceFilter = BuildDistanceFilter(effectiveMinSimilarity, "embedding <=> @embedding");
+
         string sql =
             $@"
             SELECT id, type_legacy, content, text, source, embedding, embedding_metadata, tags, confidence, created_at, updated_at, title, current_version, owner_type, owner_id, archetype, embedding <=> @embedding AS similarity
             FROM memories
-            WHERE embedding <=> @embedding < @maxDistance
+            WHERE embedding IS NOT NULL
+            {distanceFilter}
             {archetypeFilter}
             ORDER BY embedding <=> @embedding LIMIT @limit";
 
@@ -1292,19 +1337,23 @@ public class Storage : IStorage
 
         List<Memorizer.Models.Memory> memories = [];
         List<MemoryId> memoryIds = new();
-        await using NpgsqlDataReader reader = await cmd.ExecuteReaderAsync(cancellationToken);
-
-        while (await reader.ReadAsync(cancellationToken))
+        // Read the matched memories first, then dispose the reader before the relationship query
+        // runs on the SAME connection (Npgsql has no MARS), keeping this call to a single pooled
+        // connection and preventing hold-and-wait pool deadlock under concurrency.
+        await using (NpgsqlDataReader reader = await cmd.ExecuteReaderAsync(cancellationToken))
         {
-            var memory = ReadMemoryFromReader(reader, withSimilarity: true);
-            memories.Add(memory);
-            memoryIds.Add(memory.Id);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                var memory = ReadMemoryFromReader(reader, withSimilarity: true);
+                memories.Add(memory);
+                memoryIds.Add(memory.Id);
+            }
         }
 
-        // Batch fetch relationships for all found memories
+        // Batch fetch relationships for all found memories on the same connection
         if (memoryIds.Count > 0)
         {
-            var relationships = await GetRelationshipsForMany(memoryIds, cancellationToken);
+            var relationships = await GetRelationshipsForMany(connection, memoryIds, cancellationToken);
             var relLookup = relationships.GroupBy(r => r.FromMemoryId).ToDictionary(g => g.Key, g => g.ToList());
             foreach (var memory in memories)
             {
@@ -1346,9 +1395,11 @@ public class Storage : IStorage
         bool includeUnassigned = false,
         bool includeArchived = false,
         bool includeSystem = false,
+        WorkspaceId? workspaceId = null,
         CancellationToken cancellationToken = default
     )
     {
+        EnsureOwnerScopeExclusive(projectId, workspaceId);
         var effectiveMinSimilarity = minSimilarity ?? SimilarityScore.DefaultThreshold;
 
         // Generate embedding for the query
@@ -1369,22 +1420,9 @@ public class Storage : IStorage
         int fetchLimit = limit * 2;
 
         // Build owner filter clause
-        string ownerFilter = "";
-        if (projectId.HasValue)
-        {
-            if (includeUnassigned)
-            {
-                // Include both project-owned and unfiled memories
-                ownerFilter = @"AND ((owner_type = 1 AND owner_id = @projectId)
-                               OR (owner_type = 0 AND owner_id = '00000000-0000-0000-0000-000000000000'))";
-            }
-            else
-            {
-                // Only project-owned memories
-                ownerFilter = "AND owner_type = 1 AND owner_id = @projectId";
-            }
-        }
-        // If no projectId specified, search across all memories (original behavior)
+        string ownerFilter = projectId.HasValue
+            ? BuildOwnerFilter(projectId, includeUnassigned)
+            : BuildWorkspaceOwnerFilter(workspaceId);
 
         // Build archetype filter
         // ArchetypeEnum values: Document=0, Record=1, Archived=2, System=3
@@ -1397,11 +1435,15 @@ public class Storage : IStorage
             (true, true) => ""                                 // All archetypes
         };
 
+        // minSimilarity 0.0 == no threshold: omit the distance predicate (see BuildDistanceFilter).
+        string distanceFilter = BuildDistanceFilter(effectiveMinSimilarity, "embedding_metadata <=> @embedding");
+
         string sql =
             $@"
             SELECT id, type_legacy, content, text, source, embedding, embedding_metadata, tags, confidence, created_at, updated_at, title, current_version, owner_type, owner_id, archetype, embedding_metadata <=> @embedding AS similarity
             FROM memories
-            WHERE embedding_metadata <=> @embedding < @maxDistance
+            WHERE embedding_metadata IS NOT NULL
+            {distanceFilter}
             {ownerFilter}
             {archetypeFilter}
             ORDER BY embedding_metadata <=> @embedding LIMIT @limit";
@@ -1415,22 +1457,30 @@ public class Storage : IStorage
         {
             cmd.Parameters.AddWithValue("projectId", projectId.Value.Value);
         }
+        if (workspaceId.HasValue)
+        {
+            cmd.Parameters.AddWithValue("workspaceId", workspaceId.Value.Value);
+        }
 
         List<Memorizer.Models.Memory> memories = [];
         List<MemoryId> memoryIds = new();
-        await using NpgsqlDataReader reader = await cmd.ExecuteReaderAsync(cancellationToken);
-
-        while (await reader.ReadAsync(cancellationToken))
+        // Read the matched memories first, then dispose the reader before the relationship query
+        // runs on the SAME connection (Npgsql has no MARS), keeping this call to a single pooled
+        // connection and preventing hold-and-wait pool deadlock under concurrency.
+        await using (NpgsqlDataReader reader = await cmd.ExecuteReaderAsync(cancellationToken))
         {
-            var memory = ReadMemoryFromReader(reader, withSimilarity: true);
-            memories.Add(memory);
-            memoryIds.Add(memory.Id);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                var memory = ReadMemoryFromReader(reader, withSimilarity: true);
+                memories.Add(memory);
+                memoryIds.Add(memory.Id);
+            }
         }
 
-        // Batch fetch relationships for all found memories
+        // Batch fetch relationships for all found memories on the same connection
         if (memoryIds.Count > 0)
         {
-            var relationships = await GetRelationshipsForMany(memoryIds, cancellationToken);
+            var relationships = await GetRelationshipsForMany(connection, memoryIds, cancellationToken);
             var relLookup = relationships.GroupBy(r => r.FromMemoryId).ToDictionary(g => g.Key, g => g.ToList());
             foreach (var memory in memories)
             {
@@ -1472,7 +1522,7 @@ public class Storage : IStorage
     )
     {
         var fullEmbeddingResults = await SearchWithFullEmbedding(query, limit, minSimilarity, filterTags, includeArchived: false, cancellationToken);
-        var metadataEmbeddingResults = await SearchWithMetadataEmbedding(query, limit, minSimilarity, filterTags, projectId: null, includeUnassigned: false, includeArchived: false, includeSystem: false, cancellationToken);
+        var metadataEmbeddingResults = await SearchWithMetadataEmbedding(query, limit, minSimilarity, filterTags, projectId: null, includeUnassigned: false, includeArchived: false, includeSystem: false, workspaceId: null, cancellationToken: cancellationToken);
         return (fullEmbeddingResults, metadataEmbeddingResults);
     }
 
@@ -1489,6 +1539,22 @@ public class Storage : IStorage
         return "AND owner_type = 1 AND owner_id = @projectId";
     }
 
+    private static string BuildWorkspaceOwnerFilter(WorkspaceId? workspaceId)
+    {
+        if (!workspaceId.HasValue) return "";
+
+        return @"AND ((owner_type = 0 AND owner_id = @workspaceId)
+               OR (owner_type = 1 AND owner_id IN (SELECT id FROM projects WHERE workspace_id = @workspaceId)))";
+    }
+
+    private static void EnsureOwnerScopeExclusive(ProjectId? projectId, WorkspaceId? workspaceId)
+    {
+        if (projectId.HasValue && workspaceId.HasValue)
+        {
+            throw new ArgumentException("projectId and workspaceId are mutually exclusive search scopes.", nameof(workspaceId));
+        }
+    }
+
     private static string BuildArchetypeFilter(bool includeArchived, bool includeSystem)
     {
         return (includeArchived, includeSystem) switch
@@ -1498,6 +1564,44 @@ public class Storage : IStorage
             (false, true) => "AND archetype IN (0, 1, 3)",
             (true, true) => ""
         };
+    }
+
+    /// <summary>
+    /// Builds the optional pgvector distance predicate for a similarity search, treating an
+    /// effective minimum similarity of <c>0.0</c> as "no similarity threshold".
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Vector searches filter with <c>&lt;distanceExpression&gt; &lt; @maxDistance</c>, where
+    /// <c>maxDistance = effectiveMinSimilarity.ToDistance() = 1.0 - minSimilarity</c> against
+    /// pgvector cosine distance (0 = identical, 1 = orthogonal, 2 = opposite).
+    /// </para>
+    /// <para>
+    /// Because <see cref="SimilarityScore"/> is clamped to <c>[0.0, 1.0]</c>, the smallest
+    /// expressible <c>maxDistance</c> ceiling is <c>1.0</c> (at <c>minSimilarity == 0.0</c>).
+    /// A ceiling of <c>1.0</c> still drops every row whose cosine similarity is <c>&lt;= 0</c>
+    /// (orthogonal or negatively correlated), so there is no in-range value that disables the
+    /// filter. Callers reasonably read <c>minSimilarity: 0.0</c> as "no threshold, return the
+    /// top matches regardless of sign", so we honor that by omitting the distance predicate
+    /// entirely when the effective minimum similarity is <c>0.0</c>. The caller keeps its
+    /// <c>ORDER BY &lt;distance&gt; LIMIT</c>, so the search still returns the nearest N rows.
+    /// </para>
+    /// <para>
+    /// For any positive threshold (including the <c>null =&gt; DefaultThreshold (0.7)</c> case)
+    /// the predicate is returned unchanged, preserving the historical filtering behavior.
+    /// </para>
+    /// </remarks>
+    /// <param name="effectiveMinSimilarity">The resolved minimum similarity (after applying the default).</param>
+    /// <param name="distanceExpression">The pgvector distance expression, e.g. <c>"embedding &lt;=&gt; @embedding"</c>.</param>
+    /// <returns>An <c>"AND ..."</c> SQL fragment, or an empty string when no distance filter should be applied.</returns>
+    private static string BuildDistanceFilter(SimilarityScore effectiveMinSimilarity, string distanceExpression)
+    {
+        // minSimilarity 0.0 == no threshold: omit the distance predicate so the search returns
+        // the nearest rows regardless of the sign of the cosine similarity.
+        if (effectiveMinSimilarity.Value <= 0.0)
+            return string.Empty;
+
+        return $"AND {distanceExpression} < @maxDistance";
     }
 
     /// <summary>
@@ -1527,16 +1631,21 @@ public class Storage : IStorage
         bool includeUnassigned = false,
         bool includeArchived = false,
         bool includeSystem = false,
+        WorkspaceId? workspaceId = null,
         CancellationToken cancellationToken = default
     )
     {
+        EnsureOwnerScopeExclusive(projectId, workspaceId);
+
         // Generate embedding for the query
         float[] queryEmbedding = await _embeddingService.Generate(query, cancellationToken);
 
         await using NpgsqlConnection connection = await _dataSource.OpenConnectionAsync(cancellationToken);
 
         int fetchLimit = Math.Max(limit * 3, 30);
-        string ownerFilter = BuildOwnerFilter(projectId, includeUnassigned);
+        string ownerFilter = projectId.HasValue
+            ? BuildOwnerFilter(projectId, includeUnassigned)
+            : BuildWorkspaceOwnerFilter(workspaceId);
         string archetypeFilter = BuildArchetypeFilter(includeArchived, includeSystem);
 
         // Leg 1: Vector search (metadata embedding, no hard distance threshold)
@@ -1559,6 +1668,8 @@ public class Storage : IStorage
             cmd.Parameters.AddWithValue("fetchLimit", fetchLimit);
             if (projectId.HasValue)
                 cmd.Parameters.AddWithValue("projectId", projectId.Value.Value);
+            if (workspaceId.HasValue)
+                cmd.Parameters.AddWithValue("workspaceId", workspaceId.Value.Value);
 
             await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
             while (await reader.ReadAsync(cancellationToken))
@@ -1588,6 +1699,8 @@ public class Storage : IStorage
         {
             cmd.Parameters.AddWithValue("tsquery", tsquery);
             cmd.Parameters.AddWithValue("fetchLimit", fetchLimit);
+            if (workspaceId.HasValue)
+                cmd.Parameters.AddWithValue("workspaceId", workspaceId.Value.Value);
             if (projectId.HasValue)
                 cmd.Parameters.AddWithValue("projectId", projectId.Value.Value);
 
@@ -1671,10 +1784,11 @@ public class Storage : IStorage
             memoryIds.Add(memory.Id);
         }
 
-        // Batch fetch relationships for all found memories
+        // Batch fetch relationships for all found memories on the same connection (no reader is
+        // open here; the leg queries above ran in their own scoped blocks).
         if (memoryIds.Count > 0)
         {
-            var relationships = await GetRelationshipsForMany(memoryIds, cancellationToken);
+            var relationships = await GetRelationshipsForMany(connection, memoryIds, cancellationToken);
             var relLookup = relationships.GroupBy(r => r.FromMemoryId).ToDictionary(g => g.Key, g => g.ToList());
             foreach (var memory in memories)
             {
@@ -1718,19 +1832,22 @@ public class Storage : IStorage
 
         var memories = new List<Memorizer.Models.Memory>();
         var memoryIds = new List<MemoryId>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-
-        while (await reader.ReadAsync(cancellationToken))
+        // Read the memories first, then dispose the reader before the relationship query runs on
+        // the SAME connection (Npgsql has no MARS), keeping this call to a single pooled connection.
+        await using (var reader = await command.ExecuteReaderAsync(cancellationToken))
         {
-            var memory = ReadMemoryFromReader(reader, withSimilarity: false);
-            memories.Add(memory);
-            memoryIds.Add(memory.Id);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                var memory = ReadMemoryFromReader(reader, withSimilarity: false);
+                memories.Add(memory);
+                memoryIds.Add(memory.Id);
+            }
         }
 
-        // Batch fetch relationships for all found memories
+        // Batch fetch relationships for all found memories on the same connection
         if (memoryIds.Count > 0)
         {
-            var relationships = await GetRelationshipsForMany(memoryIds, cancellationToken);
+            var relationships = await GetRelationshipsForMany(connection, memoryIds, cancellationToken);
             var relLookup = relationships.GroupBy(r => r.FromMemoryId).ToDictionary(g => g.Key, g => g.ToList());
             foreach (var memory in memories)
             {
